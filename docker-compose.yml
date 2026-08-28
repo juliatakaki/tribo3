@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:16
+    container_name: tribo3-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tribo3}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tribo3_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-tribo3}
+    ports:
+      - "5432:5432"
+    volumes:
+      - tribo3_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tribo3} -d ${POSTGRES_DB:-tribo3}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Aplica as migrations de ./migrations em ordem (V1__, V2__, ...) toda
+  # vez que o compose sobe. Idempotente: migration já aplicada é pulada.
+  migrate:
+    image: flyway/flyway:10
+    container_name: tribo3-migrate
+    depends_on:
+      db:
+        condition: service_healthy
+    command: -url=jdbc:postgresql://db:5432/${POSTGRES_DB:-tribo3} -user=${POSTGRES_USER:-tribo3} -password=${POSTGRES_PASSWORD:-tribo3_dev} -connectRetries=10 migrate
+    volumes:
+      - ./migrations:/flyway/sql
+
+  # Interface visual pra qualquer pessoa do time inspecionar o banco
+  # sem precisar de client instalado localmente.
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: tribo3-pgadmin
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-dev@tribo3.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-tribo3_dev}
+    ports:
+      - "5050:80"
+    volumes:
+      - tribo3_pgadmin:/var/lib/pgadmin
+
+volumes:
+  tribo3_pgdata:
+  tribo3_pgadmin:
