@@ -29,6 +29,32 @@ services:
     volumes:
       - ./migrations:/flyway/sql
 
+  # Popula o banco assim que as migrations terminam: gera a massa
+  # sintética no schema `staging`, roda o pipeline de qualidade e promove
+  # as linhas aprovadas para as tabelas tipadas.
+  #
+  # Idempotente: se já houver dados, o seed.py detecta e não faz nada —
+  # rodar `up` de novo não duplica o dataset. Para repopular do zero use
+  # `docker compose down -v`.
+  seed:
+    build: ./scripts
+    container_name: tribo3-seed
+    depends_on:
+      migrate:
+        # O Flyway sai com código 0 quando termina; sem esperar por isso o
+        # gerador tentaria escrever em tabelas que ainda não existem.
+        condition: service_completed_successfully
+    restart: "no"
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-tribo3}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tribo3_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-tribo3}
+      N_PARTICIPANTES: ${N_PARTICIPANTES:-300}
+      SEED: ${SEED:-42}
+      DATA_REFERENCIA: ${DATA_REFERENCIA:-}
+
   # Interface visual pra qualquer pessoa do time inspecionar o banco
   # sem precisar de client instalado localmente.
   pgadmin:

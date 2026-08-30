@@ -1,30 +1,36 @@
 """
 Gerador de massa sintética — Tribo 3
-Fase 2: gera participantes, eventos, exposição e contribuições/benefícios,
-injeta imperfeições controladas (seção 5.1 do documento) e registra o
-gabarito em gabarito.registro_erro_injetado.
+
+Gera participantes, eventos, exposição e contribuições/benefícios, injeta
+as imperfeições controladas do §5.1 e registra o gabarito em
+gabarito.registro_erro_injetado.
+
+O destino é o schema `staging` (todo campo TEXT NULL), não as tabelas
+tipadas: é o que permite gravar nulo em campo obrigatório e data em
+formato trocado, como o §5.1 exige. Quem promove staging -> tabelas
+finais é o pipeline_qualidade.py.
 
 Uso:
     python gerar_dataset.py --n-participantes 300 --seed 42
 
-Requisitos: pip install -r requirements.txt
-Espera o banco já migrado (V1__schema_inicial.sql aplicado).
+Mesma seed = mesmo dataset (§6, reprodutibilidade).
 """
 
 import argparse
-import os
 import random
 import uuid
 from datetime import date, timedelta
 
-import psycopg2
 import psycopg2.extras
 from faker import Faker
 
-# ---------- domínios fixos (batem com os enums do V1) ----------
+from db import conectar
+from dominio import (PLANO_TIPOS, SEXOS, SUBMASSAS, TIPOS_ERRO, novo_uuid,
+                     to_text)
+from injetores import INJETORES
 
-PLANO_TIPOS = ["BD", "CD", "CV"]
-SUBMASSAS = ["Plano A", "Plano B", "Plano C"]
+# ---------- parâmetros de geração (declarados no data card, §6) ----------
+
 STATUS_PESOS = [
     ("ativo", 0.55),
     ("aposentado", 0.20),
@@ -32,17 +38,28 @@ STATUS_PESOS = [
     ("obito", 0.05),
     ("pensionista", 0.05),
 ]
+
+# Só desligado e óbito encerram o vínculo. Aposentado e pensionista
+# continuam no plano — o §3.1 define data_desligamento como "preenchida
+# se houver desligamento", e preenchê-la para aposentados truncaria a
+# exposição ao risco e enviesaria o qx.
+STATUS_QUE_DESLIGAM = ("desligado", "obito")
+
 STATUS_PARA_EVENTO = {
     "obito": "obito",
-    "aposentado": "aposentacao" if False else "aposentadoria",
+    "aposentado": "aposentadoria",
     "desligado": "desligamento",
     "pensionista": "invalidez",  # simplificação: pensionista via invalidez
 }
-TAXA_INJECAO = 0.05  # % de participantes que recebem alguma imperfeição
-TIPOS_ERRO = [
-    "idade_invalida", "duplicidade", "grafia_divergente", "nulo",
-    "outlier", "orfao", "atraso_anomalo", "unidade_trocada",
-]
+
+TAXA_INJECAO = 0.05  # fração dos participantes que recebe alguma imperfeição
+MESES_CONTRIBUICAO = 6
+
+# Data-base do lote. Fica num global porque atravessa quase toda função
+# de geração. O §6 exige "mesma seed = mesmo resultado": com date.today()
+# implícito, rodar amanhã produziria um dataset diferente com a mesma
+# seed, então a data entra como parâmetro explícito (--data-referencia).
+DATA_REFERENCIA = date.today()
 
 
 def escolher_status(rng):
@@ -52,36 +69,47 @@ def escolher_status(rng):
 
 
 def gerar_participante(fake, rng):
-    nascimento = fake.date_of_birth(minimum_age=20, maximum_age=70)
-    ingresso = fake.date_between(start_date=nascimento + timedelta(days=18 * 365), end_date="-30d")
+    nascimento = DATA_REFERENCIA - timedelta(days=rng.randint(20, 70) * 365)
+    ingresso = fake.date_between_dates(
+        date_start=nascimento + timedelta(days=18 * 365),
+        date_end=DATA_REFERENCIA - timedelta(days=30),
+    )
     status = escolher_status(rng)
-    desligamento = None
-    if status in ("desligado", "aposentado", "obito", "pensionista"):
-        desligamento = fake.date_between(start_date=ingresso, end_date="today")
+
+    # Data em que o status mudou (para quem não é mais ativo). Vira
+    # data_evento e, só para quem de fato desliga, data_desligamento.
+    data_mudanca = None
+    if status != "ativo":
+        data_mudanca = fake.date_between_dates(
+            date_start=ingresso, date_end=DATA_REFERENCIA
+        )
 
     return {
-        "participante_id": str(uuid.uuid4()),
+        "participante_id": novo_uuid(rng),
+        "cpf_sintetico": fake.cpf().replace(".", "").replace("-", ""),
         "plano_tipo": rng.choice(PLANO_TIPOS),
         "submassa": rng.choice(SUBMASSAS),
-        "sexo": rng.choice(["M", "F"]),
+        "sexo": rng.choice(SEXOS),
         "data_nascimento": nascimento,
         "data_ingresso": ingresso,
-        "data_desligamento": desligamento,
+        "data_desligamento": data_mudanca if status in STATUS_QUE_DESLIGAM else None,
         "status_atual": status,
         "data_evento_conhecimento": ingresso + timedelta(days=rng.randint(1, 5)),
         "data_vigencia_inicio": ingresso,
         "data_vigencia_fim": None,
         "versao_registro": 1,
+        # Campo interno, não persistido: só orienta evento e exposição.
+        "_data_mudanca": data_mudanca,
     }
 
 
-def gerar_evento(participante, fake, rng):
+def gerar_evento(participante, rng):
     tipo = STATUS_PARA_EVENTO.get(participante["status_atual"])
-    if tipo is None or participante["data_desligamento"] is None:
+    if tipo is None:
         return None
-    data_evento = participante["data_desligamento"]
+    data_evento = participante["_data_mudanca"]
     return {
-        "evento_id": str(uuid.uuid4()),
+        "evento_id": novo_uuid(rng),
         "participante_id": participante["participante_id"],
         "tipo_evento": tipo,
         "data_evento": data_evento,
@@ -90,192 +118,212 @@ def gerar_evento(participante, fake, rng):
     }
 
 
+def _fim_da_exposicao(participante):
+    """Até quando o participante está exposto ao risco.
+
+    Desligamento e óbito encerram; aposentadoria e invalidez não — quem
+    se aposenta continua exposto ao risco de morte dentro do plano.
+    """
+    if participante["status_atual"] in STATUS_QUE_DESLIGAM:
+        return participante["data_desligamento"]
+    return DATA_REFERENCIA
+
+
 def gerar_exposicao(participante, rng):
+    """Uma linha por ano civil entre o ingresso e o fim da exposição."""
     linhas = []
-    fim = participante["data_desligamento"] or date.today()
-    ano_inicio = participante["data_ingresso"].year
-    ano_fim = fim.year
-    for ano in range(ano_inicio, ano_fim + 1):
-        idade = ano - participante["data_nascimento"].year
-        ultimo_ano = ano == ano_fim
+    inicio = participante["data_ingresso"]
+    fim = _fim_da_exposicao(participante)
+    nascimento = participante["data_nascimento"]
+
+    for ano in range(inicio.year, fim.year + 1):
+        janela_inicio = max(inicio, date(ano, 1, 1))
+        janela_fim = min(fim, date(ano, 12, 31))
+        if janela_fim < janela_inicio:
+            continue
+        ultimo_ano = ano == fim.year
+
         tipo_saida = "censura"
         if ultimo_ano and participante["status_atual"] == "obito":
             tipo_saida = "obito"
-        elif ultimo_ano and participante["status_atual"] in ("desligado",):
+        elif ultimo_ano and participante["status_atual"] == "desligado":
             tipo_saida = "saida_estudo"
+
+        # Idade exata na data-base, calculada de fato (não ano - ano).
+        idade = (janela_fim - nascimento).days / 365.25
+        # +1 porque a janela é inclusiva nas duas pontas.
+        tempo = ((janela_fim - janela_inicio).days + 1) / 365.25
+
         linhas.append({
-            "exposicao_id": str(uuid.uuid4()),
+            "exposicao_id": novo_uuid(rng),
             "participante_id": participante["participante_id"],
             "submassa": participante["submassa"],
-            "idade_exata": round(idade + rng.random(), 3),
+            "idade_exata": round(idade, 3),
             "ano_calendario": ano,
-            "tempo_exposto": round(rng.uniform(0.5, 1.0), 5) if ultimo_ano else 1.0,
+            "tempo_exposto": round(min(tempo, 1.0), 5),
             "tipo_saida": tipo_saida,
-            "data_base": date(ano, 12, 31) if not ultimo_ano else fim,
+            "data_base": janela_fim,
         })
     return linhas
 
 
 def gerar_contribuicoes(participante, rng):
+    """Até 6 competências mensais antes do fim do vínculo."""
     linhas = []
-    fim = participante["data_desligamento"] or date.today()
-    meses = min(6, max(1, (fim.year - participante["data_ingresso"].year) * 12 + 1))
-    competencia = date(fim.year, fim.month, 1)
-    for i in range(meses):
-        mes = competencia.month - i
-        ano = competencia.year
-        while mes <= 0:
-            mes += 12
-            ano -= 1
+    fim = _fim_da_exposicao(participante)
+    em_beneficio = participante["status_atual"] in ("aposentado", "pensionista")
+    ano, mes = fim.year, fim.month
+
+    for _ in range(MESES_CONTRIBUICAO):
+        if date(ano, mes, 1) < participante["data_ingresso"].replace(day=1):
+            break
         linhas.append({
-            "id": str(uuid.uuid4()),
+            "id": novo_uuid(rng),
             "participante_id": participante["participante_id"],
             "competencia": date(ano, mes, 1),
             "valor_contribuicao": round(rng.uniform(200, 2500), 2),
-            "valor_beneficio": round(rng.uniform(1000, 5000), 2) if participante["status_atual"] in ("aposentado", "pensionista") else None,
-            "status_pagamento": rng.choices(["em_dia", "atraso", "quitado"], weights=[0.8, 0.15, 0.05], k=1)[0],
+            "valor_beneficio": round(rng.uniform(1000, 5000), 2) if em_beneficio else None,
+            "status_pagamento": rng.choices(
+                ["em_dia", "atraso", "quitado"], weights=[0.8, 0.15, 0.05], k=1
+            )[0],
         })
+        mes -= 1
+        if mes == 0:
+            mes, ano = 12, ano - 1
     return linhas
 
 
-def injetar_imperfeicao(participante, rng):
-    """Corrompe UM campo do participante e devolve o registro de gabarito.
-    Não mexe no dict original passado — devolve um dict novo."""
-    tipo = rng.choice(TIPOS_ERRO)
-    corrompido = dict(participante)
-    campo = None
-    original = None
-    injetado = None
+def injetar_imperfeicoes(rng, dados, n_alvos):
+    """Aplica n_alvos imperfeições entre os 9 tipos do §5.1.
 
-    if tipo == "idade_invalida":
-        campo = "data_nascimento"
-        original = str(participante["data_nascimento"])
-        corrompido["data_nascimento"] = date(1880, 1, 1)  # idade > 130
-        injetado = str(corrompido["data_nascimento"])
-    elif tipo == "grafia_divergente":
-        campo = "submassa"
-        original = participante["submassa"]
-        corrompido["submassa"] = original.replace("Plano ", "PLANO_").lower()
-        injetado = corrompido["submassa"]
-    elif tipo == "nulo":
-        campo = "data_ingresso"
-        original = str(participante["data_ingresso"])
-        # data_ingresso é NOT NULL no schema — simular como valor sentinela
-        # até decidirem se esse campo pode aceitar nulo de fato.
-        corrompido["data_ingresso"] = participante["data_nascimento"]
-        injetado = "valor_sentinela_nao_null"
-    elif tipo == "outlier":
-        campo = "data_desligamento"
-        original = str(participante["data_desligamento"])
-        corrompido["data_desligamento"] = participante["data_ingresso"] - timedelta(days=365)
-        injetado = str(corrompido["data_desligamento"])
-    else:
-        # duplicidade, orfao, atraso_anomalo, unidade_trocada tratados fora
-        # (afetam mais de uma tabela) — deixados como TODO explícito.
-        return participante, None
+    A primeira rodada percorre os 9 tipos uma vez cada, em ordem
+    embaralhada: com sorteio puro e poucos alvos, algum tipo sairia com
+    zero injeções e a regra correspondente ficaria sem nada para
+    detectar — o precision/recall dele viraria NaN no relatório do §5.2.
+    Os alvos restantes são sorteados livremente.
 
-    gabarito = {
-        "tabela_alvo": "participante",
-        "registro_id": participante["participante_id"],
-        "campo_afetado": campo,
-        "tipo_erro": tipo,
-        "valor_correto_original": original,
-        "valor_injetado": injetado,
-    }
-    return corrompido, gabarito
+    Quando o tipo escolhido não tem alvo disponível no lote, tenta os
+    demais, para que a taxa de injeção declarada valha de fato.
+    """
+    gabarito = []
+    usados = set()
+
+    ordem = rng.sample(TIPOS_ERRO, k=len(TIPOS_ERRO))
+    for i in range(max(n_alvos, len(TIPOS_ERRO))):
+        if i < len(ordem):
+            preferidos = [ordem[i]]
+        else:
+            preferidos = rng.sample(TIPOS_ERRO, k=len(TIPOS_ERRO))
+        for tipo in preferidos + TIPOS_ERRO:
+            linhas = INJETORES[tipo](rng, dados, usados)
+            if linhas:
+                gabarito.extend(linhas)
+                break
+    return gabarito
+
+
+# ---------- escrita no staging ----------
+
+COLUNAS_STAGING = {
+    "staging.participante": [
+        "participante_id", "cpf_sintetico", "plano_tipo", "submassa", "sexo",
+        "data_nascimento", "data_ingresso", "data_desligamento", "status_atual",
+        "data_evento_conhecimento", "data_vigencia_inicio", "data_vigencia_fim",
+        "versao_registro",
+    ],
+    "staging.evento": [
+        "evento_id", "participante_id", "tipo_evento", "data_evento",
+        "data_conhecimento", "fonte",
+    ],
+    "staging.exposicao": [
+        "exposicao_id", "participante_id", "submassa", "idade_exata",
+        "ano_calendario", "tempo_exposto", "tipo_saida", "data_base",
+    ],
+    "staging.contribuicao_beneficio": [
+        "id", "participante_id", "competencia", "valor_contribuicao",
+        "valor_beneficio", "status_pagamento",
+    ],
+}
+
+
+def inserir_staging(cur, tabela, registros, lote_id):
+    if not registros:
+        return
+    colunas = COLUNAS_STAGING[tabela]
+    lista = ", ".join(["lote_id"] + colunas)
+    valores = [
+        tuple([lote_id] + [to_text(r[c]) for c in colunas]) for r in registros
+    ]
+    psycopg2.extras.execute_values(
+        cur, f"INSERT INTO {tabela} ({lista}) VALUES %s", valores
+    )
 
 
 def main():
+    global DATA_REFERENCIA
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-participantes", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data-referencia", type=date.fromisoformat,
+                        default=DATA_REFERENCIA,
+                        help="data-base do lote (ISO). Fixe para reproduzir "
+                             "um dataset antigo byte a byte.")
     args = parser.parse_args()
+    DATA_REFERENCIA = args.data_referencia
 
     Faker.seed(args.seed)
     rng = random.Random(args.seed)
     fake = Faker("pt_BR")
 
-    participantes, eventos, exposicoes, contribuicoes, gabarito = [], [], [], [], []
+    dados = {"participantes": [], "eventos": [], "exposicoes": [], "contribuicoes": []}
 
     for _ in range(args.n_participantes):
         p = gerar_participante(fake, rng)
-        if rng.random() < TAXA_INJECAO:
-            p, g = injetar_imperfeicao(p, rng)
-            if g:
-                gabarito.append(g)
-        participantes.append(p)
+        dados["participantes"].append(p)
 
-        ev = gerar_evento(p, fake, rng)
+        ev = gerar_evento(p, rng)
         if ev:
-            eventos.append(ev)
-        exposicoes.extend(gerar_exposicao(p, rng))
-        contribuicoes.extend(gerar_contribuicoes(p, rng))
+            dados["eventos"].append(ev)
+        dados["exposicoes"].extend(gerar_exposicao(p, rng))
+        dados["contribuicoes"].extend(gerar_contribuicoes(p, rng))
 
-    conn = psycopg2.connect(
-        host=os.environ.get("PGHOST", "localhost"),
-        port=os.environ.get("PGPORT", "5432"),
-        dbname=os.environ.get("POSTGRES_DB", "tribo3"),
-        user=os.environ.get("POSTGRES_USER", "tribo3"),
-        password=os.environ.get("POSTGRES_PASSWORD", "tribo3_dev"),
-    )
+    # Injeção depois da geração completa: os injetores de duplicidade e
+    # órfão precisam do lote inteiro montado para escolher alvos.
+    n_alvos = round(args.n_participantes * TAXA_INJECAO)
+    gabarito = injetar_imperfeicoes(rng, dados, n_alvos)
+
+    lote_id = str(uuid.uuid4())
+    conn = conectar()
     cur = conn.cursor()
 
-    psycopg2.extras.execute_values(cur, """
-        INSERT INTO participante (participante_id, plano_tipo, submassa, sexo,
-            data_nascimento, data_ingresso, data_desligamento, status_atual,
-            data_evento_conhecimento, data_vigencia_inicio, data_vigencia_fim,
-            versao_registro)
-        VALUES %s
-    """, [(p["participante_id"], p["plano_tipo"], p["submassa"], p["sexo"],
-           p["data_nascimento"], p["data_ingresso"], p["data_desligamento"],
-           p["status_atual"], p["data_evento_conhecimento"],
-           p["data_vigencia_inicio"], p["data_vigencia_fim"], p["versao_registro"])
-          for p in participantes])
-
-    if eventos:
-        psycopg2.extras.execute_values(cur, """
-            INSERT INTO evento (evento_id, participante_id, tipo_evento,
-                data_evento, data_conhecimento, fonte)
-            VALUES %s
-        """, [(e["evento_id"], e["participante_id"], e["tipo_evento"],
-               e["data_evento"], e["data_conhecimento"], e["fonte"])
-              for e in eventos])
-
-    if exposicoes:
-        psycopg2.extras.execute_values(cur, """
-            INSERT INTO exposicao (exposicao_id, participante_id, submassa,
-                idade_exata, ano_calendario, tempo_exposto, tipo_saida, data_base)
-            VALUES %s
-        """, [(x["exposicao_id"], x["participante_id"], x["submassa"],
-               x["idade_exata"], x["ano_calendario"], x["tempo_exposto"],
-               x["tipo_saida"], x["data_base"]) for x in exposicoes])
-
-    if contribuicoes:
-        psycopg2.extras.execute_values(cur, """
-            INSERT INTO contribuicao_beneficio (id, participante_id, competencia,
-                valor_contribuicao, valor_beneficio, status_pagamento)
-            VALUES %s
-        """, [(c["id"], c["participante_id"], c["competencia"],
-               c["valor_contribuicao"], c["valor_beneficio"], c["status_pagamento"])
-              for c in contribuicoes])
+    inserir_staging(cur, "staging.participante", dados["participantes"], lote_id)
+    inserir_staging(cur, "staging.evento", dados["eventos"], lote_id)
+    inserir_staging(cur, "staging.exposicao", dados["exposicoes"], lote_id)
+    inserir_staging(cur, "staging.contribuicao_beneficio", dados["contribuicoes"], lote_id)
 
     if gabarito:
         psycopg2.extras.execute_values(cur, """
-            INSERT INTO gabarito.registro_erro_injetado (erro_id, tabela_alvo,
-                registro_id, campo_afetado, tipo_erro, valor_correto_original,
-                valor_injetado)
+            INSERT INTO gabarito.registro_erro_injetado (tabela_alvo, registro_id,
+                campo_afetado, tipo_erro, valor_correto_original, valor_injetado)
             VALUES %s
-        """, [(str(uuid.uuid4()), g["tabela_alvo"], g["registro_id"],
-               g["campo_afetado"], g["tipo_erro"], g["valor_correto_original"],
-               g["valor_injetado"]) for g in gabarito])
+        """, [(g["tabela_alvo"], g["registro_id"], g["campo_afetado"], g["tipo_erro"],
+               g["valor_correto_original"], g["valor_injetado"]) for g in gabarito])
 
     conn.commit()
     cur.close()
     conn.close()
 
-    print(f"Gerado: {len(participantes)} participantes, {len(eventos)} eventos, "
-          f"{len(exposicoes)} linhas de exposição, {len(contribuicoes)} contribuições, "
-          f"{len(gabarito)} erros injetados (seed={args.seed}).")
+    por_tipo = {}
+    for g in gabarito:
+        por_tipo[g["tipo_erro"]] = por_tipo.get(g["tipo_erro"], 0) + 1
+
+    print(f"Lote {lote_id} gravado em staging "
+          f"(seed={args.seed}, data_referencia={DATA_REFERENCIA}):")
+    print(f"  {len(dados['participantes'])} participantes, {len(dados['eventos'])} eventos, "
+          f"{len(dados['exposicoes'])} exposições, {len(dados['contribuicoes'])} contribuições")
+    print(f"  {len(gabarito)} imperfeições injetadas: "
+          + ", ".join(f"{t}={n}" for t, n in sorted(por_tipo.items())))
 
 
 if __name__ == "__main__":
