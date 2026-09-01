@@ -74,15 +74,18 @@ Parâmetros e distribuições usados: ver `docs/regras_geracao.md`.
   suficiente pelo mesmo motivo de escala (poucos idosos avançados numa
   amostra de 300).
 - O benchmark contra o HMD (fonte HMD, referência Austrália 2021,
-  período não coberto pelo país Brasil na base) mostra desvio maior
-  ainda na faixa 20-29 (até ~49x em mulheres) que na comparação com a
-  IBGE. Duas causas prováveis, não isoladas uma da outra: (1)
-  mortalidade real na Austrália é bem mais baixa que no Brasil nessa
-  faixa, diferença esperada entre os países; (2) com ~300 participantes
-  divididos por sexo e faixa etária, a célula "mulheres 20-29" tem
-  exposição pequena, então poucos óbitos já mudam bastante a proporção.
-  Não dá para separar as duas causas sem examinar o n exato de cada
-  célula.
+  período não coberto pelo país Brasil na base), a BR-EMSsb v.2026
+  (fonte BR_EMS, sobrevivência, vigência 2026-2031) e a SOA RP-2014
+  Total Dataset (fonte SOA, mortalidade de ativo EUA, cobre idade
+  18-80) mostram o mesmo padrão: desvio maior na faixa 20-29, sobretudo
+  em mulheres (~49x contra HMD, ~36x contra BR-EMS, ~9x contra SOA —
+  essa última já dentro do limiar de 10x usado como alerta). Como o
+  desvio aparece de forma consistente em três fontes de referência
+  independentes na mesma célula, é mais provável ser efeito de amostra
+  pequena (poucas mulheres de 20-29 no dataset, logo poucos óbitos
+  mudam bastante a proporção) do que diferença real de mortalidade
+  entre países/fontes. Não dá para confirmar sem examinar o n exato
+  dessa célula.
 
 ## Changelog de versões do schema
 
@@ -97,3 +100,18 @@ Parâmetros e distribuições usados: ver `docs/regras_geracao.md`.
   `referencia_externa` para aceitar fontes ainda não consultadas.
 - **R\_\_dicionario_dados** / **R\_\_referencia_externa** — migrations
   repetíveis, reaplicadas sempre que o conteúdo muda.
+
+## Passo 3 — Benchmark externo (§6, referencia_externa)
+
+Concluído para as 4 fontes previstas, em ordem de prioridade:
+
+1. **IBGE** — Tábua Completa de Mortalidade 2024, Ambos os Sexos.
+2. **HMD** — Austrália 2021 (period life tables 1x1); Brasil não está
+   disponível na base, Austrália usada como referência metodológica.
+3. **BR-EMS** — BR-EMSsb v.2026 (sobrevivência), vigência 2026-2031.
+4. **SOA** — RP-2014 Rates-Total Dataset (mortalidade de ativo, EUA),
+   idade 18-80.
+
+Todas as 4 linhas de `referencia_externa` têm `versao_tabua`,
+`data_consulta` e `resultado_benchmark` preenchidos. Arquivos brutos
+versionados em `docs/referencias/`.
