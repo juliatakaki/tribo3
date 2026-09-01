@@ -1,2 +1,4 @@
 Faker==26.0.0
 psycopg2-binary>=2.9.10
+pandas
+openpyxl
