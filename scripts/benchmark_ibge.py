@@ -74,7 +74,7 @@ def qx_sintetico_por_faixa(cur, sexo=None):
               JOIN participante p ON p.participante_id = e.participante_id
              WHERE e.idade_exata >= %s AND e.idade_exata < %s
              {filtro_sexo}
-        """, params_base + [lo, hi + 1])
+        """, [lo, hi + 1] + params_base)
         obitos, exposicao = cur.fetchone()
         resultado[(lo, hi)] = (obitos / exposicao) if exposicao else None
     return resultado

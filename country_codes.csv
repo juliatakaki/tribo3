@@ -1,0 +1,51 @@
+Country,Subpop Code
+Australia,AUS
+Austria,AUT
+Belgium,BEL
+Bulgaria,BGR
+Belarus,BLR
+Canada,CAN
+Switzerland,CHE
+Chile,CHL
+Czechia,CZE
+Germany: East Germany,DEUTE
+Germany: Total population,DEUTNP
+Germany: West Germany,DEUTW
+Denmark,DNK
+Spain,ESP
+Estonia,EST
+Finland,FIN
+France: Civilian population,FRACNP
+France: Total population,FRATNP
+U.K.: Northern Ireland,GBR_NIR
+U.K.: United Kingdom Total Population,GBR_NP
+U.K.: Scotland,GBR_SCO
+U.K.: England & Wales Civilian Population,GBRCENW
+U.K.: England & Wales Total Population,GBRTENW
+Greece,GRC
+Hong Kong,HKG
+Croatia,HRV
+Hungary,HUN
+Ireland,IRL
+Iceland,ISL
+Israel,ISR
+Italy,ITA
+Japan,JPN
+Republic of Korea,KOR
+Lithuania,LTU
+Luxembourg,LUX
+Latvia,LVA
+Netherlands,NLD
+Norway,NOR
+New Zealand: Maori,NZL_MA
+New Zealand: Non-Maori,NZL_NM
+New Zealand: Total population,NZL_NP
+Poland,POL
+Portugal,PRT
+Russia,RUS
+Slovakia,SVK
+Slovenia,SVN
+Sweden,SWE
+Taiwan,TWN
+Ukraine,UKR
+U.S.A.,USA
